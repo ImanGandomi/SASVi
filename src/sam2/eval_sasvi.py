@@ -806,7 +806,7 @@ def main():
         "--overseer_type",
         type=str,
         required=True,
-        choices=['MaskRCNN', 'DETR', 'Mask2Former'],
+        choices=['MaskRCNN', 'DETR', 'Mask2Former', 'YOLO'],
 
         help="path to the Overseer model checkpoint",
     )
@@ -948,6 +948,20 @@ def main():
         mask2former_model.eval()
         overseer_model = Mask2Former(mask2former_model, shift_by_1, ignore_indices, num_classes, num_train_classes, args.dataset_type, device=args.device)
 
+    elif args.overseer_type == "YOLO":
+        from ultralytics import YOLO
+        yolo_model = YOLO(args.overseer_checkpoint)
+        yolo_model.to(args.device)
+        yolo_model.eval()
+        overseer_model = YOLOOverseer(
+            yolo_model,
+            shift_by_1,
+            ignore_indices,
+            num_classes,
+            args.dataset_type,
+            device=args.device
+        )
+
     else: 
         raise NotImplementedError
     
@@ -1001,6 +1015,53 @@ def main():
     print(f"completed SASVI prediction on {len(video_names)} videos -- "
           f"output masks saved to {args.output_mask_dir}"    
     )
+
+class YOLOOverseer():
+    def __init__(self, model, shift_by_1, ignore_indices, num_classes, dataset_type, device="cuda"):
+        self.model = model
+        self.shift_by_1 = shift_by_1
+        self.ignore_indices = ignore_indices
+        self.num_classes = num_classes
+        self.dataset_type = dataset_type
+        self.device = device
+
+    def get_prediction(self, image_list, reshape_size=None):
+        # image_list = list of paths (usually 1 frame)
+        results = self.model(image_list, conf=0.25, iou=0.45, verbose=False)  # tune conf/iou if needed
+
+        per_obj_mask = {}
+        for result in results:
+            if result.masks is None:
+                continue
+
+            masks = result.masks.data                  # (N, H, W) float [0,1]
+            cls_ids = result.boxes.cls.cpu().int().numpy()  # class indices
+
+            for i, cls_id in enumerate(cls_ids):
+                mask = (masks[i] > 0.5).cpu().numpy().astype(bool)  # binary
+
+                # Resize to original video resolution if requested
+                if reshape_size is not None:
+                    from skimage.transform import resize
+                    mask = resize(mask, reshape_size, order=0, preserve_range=True, anti_aliasing=False).astype(bool)
+
+                obj_id = int(cls_id)
+                if self.shift_by_1:
+                    obj_id -= 1
+
+                # Dataset-specific cleanup (copy from other overseers)
+                if self.dataset_type == "CADIS":
+                    if obj_id == 17:  # background?
+                        continue
+                elif self.dataset_type == "CHOLECSEG8K":
+                    if obj_id == 0:
+                        continue
+                elif self.dataset_type == "CATARACT1K":
+                    pass  # no ignore usually
+
+                per_obj_mask[obj_id] = mask
+
+        return per_obj_mask
 
 if __name__ == "__main__":
     main()
